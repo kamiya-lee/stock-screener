@@ -1,0 +1,46 @@
+name: Daily Stock Screener AI
+
+on:
+  schedule:
+    # 每天 A 股收盘后的下午 16:15（北京时间）自动运行
+    # 注：GitHub 使用 UTC 时间，比北京时间慢 8 小时（16:15 减 8 = 08:15）
+    - cron: '15 8 * * 1-5' 
+  workflow_dispatch: # 允许你在 GitHub 页面上手动点击按钮触发运行
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip' # 缓存依赖，大幅度缩短后续运行时间
+
+    # 部分量化计算库（如 TA-Lib）在 Linux 下需要编译环境，先执行系统安装
+    - name: Install Linux System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential wget
+        # 如果项目报错缺少 TA-Lib，通常需要下载源码编译，这里先保留基础包环境
+
+    - name: Install Python Dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Execute Stock Screener (CLI Mode)
+      env:
+        # 将你在 GitHub Secrets 中配置的密钥注入到系统环境变量中
+        OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
+        OPENAI_BASE_URL: ${{ secrets.LLM_BASE_URL }} # 适合使用代理、DeepSeek 或国内大模型的中转地址
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }} # 微信/飞书/钉钉等通知Token
+      run: |
+        # 【核心说明】跳过 streamlit run，直接运行项目的核心逻辑脚本
+        # 提示：请根据 xang1234 项目最新代码结构，将其中的脚本名替换为实际的后台入口（如 src/main.py 或 run.py）
+        python src/main.py --cron --config config.yaml
