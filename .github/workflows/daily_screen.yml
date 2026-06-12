@@ -44,3 +44,17 @@ jobs:
         # 【核心说明】跳过 streamlit run，直接运行项目的核心逻辑脚本
         # 提示：请根据 xang1234 项目最新代码结构，将其中的脚本名替换为实际的后台入口（如 src/main.py 或 run.py）
         python src/main.py --cron --config config.yaml
+    - name: Execute Stock Screener (CLI Mode)
+      env:
+        OPENAI_API_KEY: ${{ secrets.LLM_API_KEY }}
+        OPENAI_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+        
+        # 挂载邮件发送所需的环境变量
+        EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+        EMAIL_USER: ${{ secrets.EMAIL_USER }}
+        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        # 告诉脚本，这次我们使用邮件渠道推送
+        PUSH_CHANNEL: "mail" 
+      run: |
+        python src/main.py
