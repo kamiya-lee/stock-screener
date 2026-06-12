@@ -1,0 +1,9 @@
+# 基础选股配置示例
+market: "A-share"
+max_stock_count: 5      # 限制最终大模型分析的股票数量，防止烧钱
+enable_ai: true         # 开启大模型分析
+
+# 选股技术/基本面指标（根据项目支持的标签填写）
+filters:
+  eps_rating_min: 85    # 我们之前提到的欧奈尔 EPS 评级
+  pe_ratio_max: 25      # 估值不要太高
