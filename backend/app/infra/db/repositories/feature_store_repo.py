@@ -27,7 +27,11 @@ from app.infra.db.models.feature_store import (
     StockFeatureDaily,
 )
 from app.infra.db.portability import json_text
-from app.infra.serialization import convert_numpy_types, normalize_string_list
+from app.infra.serialization import (
+    coerce_bool_or_false,
+    convert_numpy_types,
+    normalize_string_list,
+)
 from app.infra.query.feature_store_query import (
     apply_filters,
     apply_sort_all,
@@ -133,9 +137,32 @@ def _upsert_stmt(session: Session, values: list[dict[str, Any]]):
             "composite_score": stmt.excluded.composite_score,
             "overall_rating": stmt.excluded.overall_rating,
             "passes_count": stmt.excluded.passes_count,
+            "rs_line_new_high": stmt.excluded.rs_line_new_high,
+            "rs_line_new_high_before_price": stmt.excluded.rs_line_new_high_before_price,
+            "rs_line_blue_dot_recent": stmt.excluded.rs_line_blue_dot_recent,
+            "rs_line_new_high_date": stmt.excluded.rs_line_new_high_date,
             "details_json": stmt.excluded.details_json,
         },
     )
+
+
+def _snapshot_row_values(run_id: int, row: FeatureRowWrite) -> dict[str, Any]:
+    details = convert_numpy_types(row.details) or {}
+    return {
+        "run_id": run_id,
+        "symbol": row.symbol,
+        "as_of_date": row.as_of_date,
+        "composite_score": convert_numpy_types(row.composite_score),
+        "overall_rating": convert_numpy_types(row.overall_rating),
+        "passes_count": convert_numpy_types(row.passes_count),
+        "rs_line_new_high": coerce_bool_or_false(details.get("rs_line_new_high")),
+        "rs_line_new_high_before_price": coerce_bool_or_false(
+            details.get("rs_line_new_high_before_price")
+        ),
+        "rs_line_blue_dot_recent": coerce_bool_or_false(details.get("rs_line_blue_dot_recent")),
+        "rs_line_new_high_date": details.get("rs_line_new_high_date"),
+        "details_json": details,
+    }
 
 
 class SqlFeatureStoreRepository(FeatureStoreRepository):
@@ -155,18 +182,7 @@ class SqlFeatureStoreRepository(FeatureStoreRepository):
         count = 0
         for i in range(0, len(rows), _BATCH_SIZE):
             batch = rows[i : i + _BATCH_SIZE]
-            values = [
-                {
-                    "run_id": run_id,
-                    "symbol": row.symbol,
-                    "as_of_date": row.as_of_date,
-                    "composite_score": convert_numpy_types(row.composite_score),
-                    "overall_rating": convert_numpy_types(row.overall_rating),
-                    "passes_count": convert_numpy_types(row.passes_count),
-                    "details_json": convert_numpy_types(row.details),
-                }
-                for row in batch
-            ]
+            values = [_snapshot_row_values(run_id, row) for row in batch]
             stmt = _upsert_stmt(self._session, values)
             self._session.execute(stmt)
             count += len(batch)
@@ -481,6 +497,8 @@ class SqlFeatureStoreRepository(FeatureStoreRepository):
         self,
         run_id: int,
         ibd_industry_group: str,
+        *,
+        include_sparklines: bool = False,
     ) -> tuple[ScanResultItemDomain, ...]:
         """Return all stocks in the same IBD industry group for a feature run.
 
@@ -505,7 +523,7 @@ class SqlFeatureStoreRepository(FeatureStoreRepository):
         return tuple(
             _map_feature_to_scan_result(
                 *_unpack_feature_joined_row(row),
-                include_sparklines=False,
+                include_sparklines=include_sparklines,
             )
             for row in rows
         )
@@ -782,11 +800,28 @@ def _map_feature_to_scan_result(
         "eps_rating": d.get("eps_rating"),
         "ibd_industry_group": d.get("ibd_industry_group"),
         "ibd_group_rank": d.get("ibd_group_rank"),
+        "ibd_group_rank_date": d.get("ibd_group_rank_date"),
         "market_themes": normalize_string_list(d.get("market_themes")),
         "gics_sector": d.get("gics_sector"),
         "gics_industry": d.get("gics_industry"),
         "rs_sparkline_data": d.get("rs_sparkline_data") if include_sparklines else None,
         "rs_trend": d.get("rs_trend"),
+        "rs_line_new_high": coerce_bool_or_false(
+            row.rs_line_new_high
+            if row.rs_line_new_high is not None
+            else d.get("rs_line_new_high")
+        ),
+        "rs_line_new_high_before_price": coerce_bool_or_false(
+            row.rs_line_new_high_before_price
+            if row.rs_line_new_high_before_price is not None
+            else d.get("rs_line_new_high_before_price")
+        ),
+        "rs_line_blue_dot_recent": coerce_bool_or_false(
+            row.rs_line_blue_dot_recent
+            if row.rs_line_blue_dot_recent is not None
+            else d.get("rs_line_blue_dot_recent")
+        ),
+        "rs_line_new_high_date": row.rs_line_new_high_date or d.get("rs_line_new_high_date"),
         "price_sparkline_data": d.get("price_sparkline_data") if include_sparklines else None,
         "price_change_1d": d.get("price_change_1d"),
         "price_trend": d.get("price_trend"),

@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in desktop packaging
     redis = Any  # type: ignore
 
 from ..database import SessionLocal
+from ..domain.markets.cn_symbols import cn_price_symbol_for_native_provider
 from ..models.stock import StockPrice
 from ..models.stock_universe import StockUniverse, UNIVERSE_STATUS_ACTIVE
 from ..config import settings
@@ -36,6 +37,12 @@ from .cache.price_cache_freshness import PriceCacheFreshnessPolicy
 from .cache.market_cache_policy import MarketAwareCachePolicy, market_cache_policy
 from .cache.price_cache_warmup import PriceCacheWarmupStore
 from .errors import CacheRefreshError
+from .price_row_normalization import (
+    normalize_price_batch,
+    normalize_price_frame,
+    stock_price_row_from_ohlcv,
+)
+from .stock_price_persistence import persist_stock_price_mappings
 from .redis_pool import get_redis_client, get_bulk_redis_client, is_redis_enabled
 
 logger = logging.getLogger(__name__)
@@ -331,9 +338,13 @@ class PriceCacheService:
             # Convert Date to pd.Timestamp for consistency with yfinance data
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
+            df = normalize_price_frame(df, min_rows=50)
+            if df is None:
+                logger.debug(f"Insufficient finite cached data for {symbol}")
+                return None, None
 
             # Get last date
-            last_date = prices[-1].date
+            last_date = df.index[-1].date()
 
             logger.debug(f"Retrieved {symbol} from database ({len(df)} rows, last: {last_date})")
             return df, last_date
@@ -435,8 +446,12 @@ class PriceCacheService:
                     df = pd.DataFrame(data)
                     df['Date'] = pd.to_datetime(df['Date'])
                     df.set_index('Date', inplace=True)
+                    df = normalize_price_frame(df, min_rows=50)
+                    if df is None:
+                        results[symbol] = (None, None)
+                        continue
 
-                    last_date = prices[-1].date
+                    last_date = df.index[-1].date()
                     results[symbol] = (df, last_date)
 
                 logger.debug(
@@ -471,8 +486,9 @@ class PriceCacheService:
         try:
             data = self._fetch_direct_historical_data(symbol, period=period)
 
-            if data is None or data.empty:
-                logger.warning(f"Failed to fetch data for {symbol}")
+            data = normalize_price_frame(data)
+            if data is None:
+                logger.warning("Failed to fetch finite price data for %s", symbol)
                 return None
 
             logger.info(f"Fetched {symbol}: {len(data)} rows")
@@ -535,10 +551,17 @@ class PriceCacheService:
             from .security_master_service import security_master_resolver
 
             identity = security_master_resolver.resolve_identity(symbol=symbol, market="CN")
-            local_code = str(identity.local_code or "").strip()
-            if not local_code.isdigit():
+            provider_symbol = cn_price_symbol_for_native_provider(
+                symbol,
+                local_code=identity.local_code,
+                canonical_symbol=identity.canonical_symbol,
+            )
+            if provider_symbol is None:
                 return None
-            return CnMarketDataService().daily_ohlcv_dataframe(local_code, period=period)
+            return CnMarketDataService().daily_ohlcv_dataframe(
+                provider_symbol,
+                period=period,
+            )
         except Exception as exc:  # pragma: no cover - provider/network variability
             logger.warning("CN historical fetch failed for %s: %s", symbol, exc)
             return None
@@ -577,6 +600,10 @@ class PriceCacheService:
         we only fetch the missing days!
         """
         try:
+            cached_data = normalize_price_frame(cached_data)
+            if cached_data is None:
+                return self._fetch_full_and_cache(symbol, period, market=market)
+
             # Calculate how many days we're missing
             today = datetime.now().date()
             days_missing = (today - last_cached_date).days
@@ -596,8 +623,9 @@ class PriceCacheService:
             # Fetch only recent data (last 7 days to ensure overlap)
             new_data = self._fetch_direct_historical_data(symbol, period="7d")
 
-            if new_data is None or new_data.empty:
-                logger.warning(f"Failed to fetch incremental data for {symbol}")
+            new_data = normalize_price_frame(new_data)
+            if new_data is None:
+                logger.warning(f"Failed to fetch finite incremental data for {symbol}")
                 return cached_data  # Return stale cache as fallback
 
             # Filter new_data to only dates after last_cached_date
@@ -610,8 +638,9 @@ class PriceCacheService:
             else:
                 new_data_filtered = new_data[new_data.index > last_cached_ts]
 
-            if new_data_filtered.empty:
-                logger.info(f"No new data available for {symbol}")
+            new_data_filtered = normalize_price_frame(new_data_filtered)
+            if new_data_filtered is None:
+                logger.info(f"No finite new data available for {symbol}")
                 return cached_data
 
             logger.info(f"Fetched {len(new_data_filtered)} new rows for {symbol}")
@@ -641,6 +670,10 @@ class PriceCacheService:
             cutoff_date = today - timedelta(days=days)
 
             merged_data = merged_data[merged_data.index >= pd.Timestamp(cutoff_date)]
+            merged_data = normalize_price_frame(merged_data)
+            if merged_data is None:
+                logger.warning("Merged %s data produced no finite close rows", symbol)
+                return None
 
             logger.info(f"Merged data for {symbol}: {len(merged_data)} total rows")
 
@@ -688,6 +721,10 @@ class PriceCacheService:
             return
 
         try:
+            data = normalize_price_frame(data)
+            if data is None:
+                return
+
             # Keep last 5 years (1825 days) for volume analysis
             cutoff_datetime = datetime.now() - timedelta(days=self.RECENT_DAYS)
             # Convert to pd.Timestamp to ensure compatibility with pandas index
@@ -1358,6 +1395,9 @@ class PriceCacheService:
         db = self._session_factory()
 
         try:
+            data = normalize_price_frame(data)
+            if data is None:
+                return
             # Reset index to get Date as a column
             df = data.reset_index()
             if 'Date' not in df.columns and len(df.columns) > 0:
@@ -1397,16 +1437,13 @@ class PriceCacheService:
 
                 # Prepare row for bulk insert
                 try:
-                    price_dict = {
-                        'symbol': symbol,
-                        'date': row_date,
-                        'open': float(row.get('Open', 0)),
-                        'high': float(row.get('High', 0)),
-                        'low': float(row.get('Low', 0)),
-                        'close': float(row.get('Close', 0)),
-                        'volume': int(row.get('Volume', 0)) if pd.notna(row.get('Volume')) else 0,
-                        'adj_close': float(row.get('Adj Close', row.get('Close', 0))),
-                    }
+                    price_dict = stock_price_row_from_ohlcv(
+                        symbol=symbol,
+                        row_date=row_date,
+                        row=row,
+                    )
+                    if price_dict is None:
+                        continue
                     existing_id = existing_rows.get(row_date)
                     if existing_id is None:
                         rows_to_insert.append(price_dict)
@@ -1473,6 +1510,10 @@ class PriceCacheService:
         if data is None or data.empty:
             logger.warning(f"Cannot cache {symbol}: data is empty")
             return
+        data = normalize_price_frame(data)
+        if data is None:
+            logger.warning(f"Cannot cache {symbol}: no finite close rows")
+            return
 
         try:
             # Store in Redis
@@ -1506,6 +1547,9 @@ class PriceCacheService:
         Returns:
             Number of symbols successfully cached
         """
+        if not batch_data:
+            return 0
+        batch_data = normalize_price_batch(batch_data)
         if not batch_data:
             return 0
 
@@ -1596,44 +1640,14 @@ class PriceCacheService:
         """
         if not batch_data:
             return
+        batch_data = normalize_price_batch(batch_data)
+        if not batch_data:
+            return
 
         db = self._session_factory()
 
         try:
-            symbols = list(batch_data.keys())
-
-            symbol_dates: Dict[str, set] = {}
-            latest_dates: Dict[str, date] = {}
-            for symbol, data in batch_data.items():
-                if data is None or data.empty:
-                    continue
-                normalized = set()
-                latest = None
-                for raw_date in data.reset_index()["Date"]:
-                    row_date = raw_date
-                    if isinstance(row_date, pd.Timestamp):
-                        row_date = row_date.date()
-                    elif isinstance(row_date, datetime):
-                        row_date = row_date.date()
-                    normalized.add(row_date)
-                    latest = row_date if latest is None or row_date > latest else latest
-                if normalized:
-                    symbol_dates[symbol] = normalized
-                    latest_dates[symbol] = latest
-
-            existing_pairs: Dict[tuple[str, date], int] = {}
-            for chunk_start in range(0, len(symbols), 100):
-                chunk_symbols = symbols[chunk_start:chunk_start + 100]
-                rows = db.query(StockPrice.id, StockPrice.symbol, StockPrice.date).filter(
-                    StockPrice.symbol.in_(chunk_symbols)
-                ).all()
-                for record_id, record_symbol, record_date in rows:
-                    target_dates = symbol_dates.get(record_symbol)
-                    if target_dates and record_date in target_dates:
-                        existing_pairs[(record_symbol, record_date)] = record_id
-
-            rows_to_insert = []
-            rows_to_update = []
+            price_rows_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
             for symbol, data in batch_data.items():
                 if data is None or data.empty:
                     continue
@@ -1649,45 +1663,28 @@ class PriceCacheService:
                         row_date = row_date.date()
 
                     try:
-                        price_dict = {
-                            'symbol': symbol,
-                            'date': row_date,
-                            'open': float(row.get('Open', 0)),
-                            'high': float(row.get('High', 0)),
-                            'low': float(row.get('Low', 0)),
-                            'close': float(row.get('Close', 0)),
-                            'volume': int(row.get('Volume', 0)) if pd.notna(row.get('Volume')) else 0,
-                            'adj_close': float(row.get('Adj Close', row.get('Close', 0))),
-                        }
-                        existing_id = existing_pairs.get((symbol, row_date))
-                        if existing_id is None:
-                            rows_to_insert.append(price_dict)
-                        elif row_date == latest_dates.get(symbol):
-                            price_dict["id"] = existing_id
-                            rows_to_update.append(price_dict)
-                    except Exception as e:
+                        price_dict = stock_price_row_from_ohlcv(
+                            symbol=symbol,
+                            row_date=row_date,
+                            row=row,
+                        )
+                        if price_dict is None:
+                            continue
+                        price_rows_by_symbol.setdefault(symbol, []).append(price_dict)
+                    except (KeyError, TypeError, ValueError, OverflowError) as e:
                         logger.warning(f"Error preparing row for {symbol}: {e}")
 
-            # Bulk insert in conservative chunks to keep statement size bounded.
-            if rows_to_insert:
-                chunk_size = 100
-                for i in range(0, len(rows_to_insert), chunk_size):
-                    chunk = rows_to_insert[i:i + chunk_size]
-                    db.bulk_insert_mappings(StockPrice, chunk)
-            if rows_to_update:
-                chunk_size = 100
-                for i in range(0, len(rows_to_update), chunk_size):
-                    chunk = rows_to_update[i:i + chunk_size]
-                    db.bulk_update_mappings(StockPrice, chunk)
-
-            if rows_to_insert or rows_to_update:
+            result = persist_stock_price_mappings(db, price_rows_by_symbol, chunk_size=100)
+            inserted = result["inserted"]
+            updated = result["updated"]
+            if inserted or updated:
                 db.commit()
                 logger.info(
                     "Batch persisted %d price rows for %d symbols (%d inserts, %d latest-day updates)",
-                    len(rows_to_insert) + len(rows_to_update),
+                    inserted + updated,
                     len(batch_data),
-                    len(rows_to_insert),
-                    len(rows_to_update),
+                    inserted,
+                    updated,
                 )
             else:
                 logger.debug(f"No new rows to persist for batch of {len(batch_data)} symbols")
@@ -1841,6 +1838,11 @@ class PriceCacheService:
                     if raw_data:
                         try:
                             df = pickle.loads(raw_data)
+                            df = normalize_price_frame(df)
+                            if df is None:
+                                cached_data[symbol] = None
+                                redis_misses.append(symbol)
+                                continue
 
                             # Check if Redis data is sufficient for requested period
                             # Redis stores last 5 years (1825 days), but verify we have at least 200 days minimum

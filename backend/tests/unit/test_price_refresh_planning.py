@@ -53,6 +53,57 @@ def test_price_history_coverage_splits_fresh_stale_and_no_history(universe_sessi
     assert coverage.no_history == ("9999.HK",)
 
 
+def test_price_history_coverage_can_require_positive_latest_volume(universe_session):
+    from app.services.price_history_coverage import classify_price_history
+
+    universe_session.add_all(
+        [
+            StockPrice(symbol="GOOD", date=date(2026, 6, 8), close=100, volume=1000),
+            StockPrice(symbol="ZERO", date=date(2026, 6, 8), close=50, volume=0),
+            StockPrice(symbol="MISSING", date=date(2026, 6, 8), close=25, volume=None),
+            StockPrice(symbol="OLD", date=date(2026, 6, 5), close=10, volume=1000),
+        ]
+    )
+    universe_session.commit()
+
+    coverage = classify_price_history(
+        universe_session,
+        symbols=["GOOD", "ZERO", "MISSING", "OLD", "NONE"],
+        as_of_date=date(2026, 6, 8),
+        require_positive_volume=True,
+    )
+
+    assert coverage.fresh == ("GOOD",)
+    assert coverage.stale == ("ZERO", "MISSING", "OLD")
+    assert coverage.no_history == ("NONE",)
+
+
+def test_price_history_coverage_can_require_positive_volume_for_selected_symbols(universe_session):
+    from app.services.price_history_coverage import classify_price_history
+
+    universe_session.add_all(
+        [
+            StockPrice(symbol="STOCK", date=date(2026, 6, 1), close=100, volume=1000),
+            StockPrice(symbol="STOCK", date=date(2026, 6, 8), close=101, volume=0),
+            StockPrice(symbol="BENCH", date=date(2026, 6, 8), close=50, volume=0),
+            StockPrice(symbol="FX", date=date(2026, 6, 8), close=1.3, volume=None),
+            StockPrice(symbol="GOOD", date=date(2026, 6, 8), close=25, volume=1000),
+        ]
+    )
+    universe_session.commit()
+
+    coverage = classify_price_history(
+        universe_session,
+        symbols=["STOCK", "BENCH", "FX", "GOOD", "NONE"],
+        as_of_date=date(2026, 6, 8),
+        symbols_requiring_positive_volume=["STOCK"],
+    )
+
+    assert coverage.fresh == ("BENCH", "FX", "GOOD")
+    assert coverage.stale == ("STOCK",)
+    assert coverage.no_history == ("NONE",)
+
+
 def test_bootstrap_plan_uses_stale_top_up_and_full_bootstrap_for_no_history(universe_session):
     from app.services.price_history_coverage import PriceHistoryCoverage
     from app.services.price_refresh_planning import (
@@ -84,6 +135,11 @@ def test_bootstrap_plan_uses_stale_top_up_and_full_bootstrap_for_no_history(univ
         (PriceRefreshJobKind.STALE, ("0700.HK",), STALE_PRICE_TOP_UP_PERIOD),
         (PriceRefreshJobKind.NO_HISTORY, ("9999.HK",), NO_HISTORY_PRICE_BOOTSTRAP_PERIOD),
     ]
+    assert plan.coverage_summary is not None
+    assert plan.coverage_summary.universe_total == 2
+    assert plan.coverage_summary.already_fresh == 0
+    assert plan.coverage_summary.live_top_up_total == 2
+    assert plan.coverage_summary.universe_total_by_market == {"HK": 2}
 
 
 def test_price_refresh_plan_excludes_unsupported_yahoo_symbols_from_live_jobs():
@@ -102,9 +158,42 @@ def test_price_refresh_plan_excludes_unsupported_yahoo_symbols_from_live_jobs():
     assert plan.all_symbols == ("0335.T", "335A.T")
     assert plan.symbols == ("335A.T",)
     assert plan.unsupported_symbols == ("0335.T",)
+    assert plan.coverage_summary is not None
+    assert plan.coverage_summary.universe_total == 2
+    assert plan.coverage_summary.live_top_up_total == 1
+    assert plan.coverage_summary.unsupported_top_up_total == 1
     assert [(job.kind, job.symbols, job.period) for job in plan.jobs] == [
         (PriceRefreshJobKind.NO_HISTORY, ("335A.T",), "2y"),
     ]
+
+
+def test_current_github_bundle_reports_unsupported_only_top_up_as_terminal_gap():
+    from app.services.price_history_coverage import PriceHistoryCoverage
+    from app.services.price_refresh_planning import (
+        PriceRefreshSource,
+        plan_price_refresh_from_input,
+    )
+
+    plan = plan_price_refresh_from_input(_planning_input(
+        all_symbols=["0335.T"],
+        effective_market="JP",
+        github_seed=_seed({
+            "status": "success",
+            "as_of_date": "2026-06-08",
+            "source_revision": "daily_prices_jp:20260608090000",
+        }),
+        coverage=PriceHistoryCoverage(no_history=("0335.T",)),
+    ))
+
+    assert plan.source is PriceRefreshSource.GITHUB
+    assert plan.symbols == ()
+    assert plan.unsupported_symbols == ("0335.T",)
+    assert plan.completion_message == (
+        "GitHub daily price bundle synced; unsupported symbols could not be live-refreshed"
+    )
+    assert plan.coverage_summary is not None
+    assert plan.coverage_summary.already_fresh == 0
+    assert plan.coverage_summary.unsupported_top_up_total == 1
 
 
 def test_full_mode_stays_full_even_when_github_sync_result_is_available(universe_session):
@@ -159,6 +248,11 @@ def test_current_github_bundle_classifies_history_without_a_second_missing_symbo
         (PriceRefreshJobKind.STALE, ("0700.HK",), STALE_PRICE_TOP_UP_PERIOD),
         (PriceRefreshJobKind.NO_HISTORY, ("9999.HK",), NO_HISTORY_PRICE_BOOTSTRAP_PERIOD),
     ]
+    assert plan.coverage_summary is not None
+    assert plan.coverage_summary.universe_total == 3
+    assert plan.coverage_summary.already_fresh == 1
+    assert plan.coverage_summary.live_top_up_total == 2
+    assert plan.coverage_summary.universe_total_by_market == {"HK": 3}
 
 
 def test_current_github_bundle_accepts_datetime_as_of_date(universe_session):

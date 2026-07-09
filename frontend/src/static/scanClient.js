@@ -44,6 +44,8 @@ const RANGE_FILTER_TO_FIELD = {
 const BOOLEAN_FILTER_TO_FIELD = {
   seSetupReady: 'se_setup_ready',
   seRsLineNewHigh: 'se_rs_line_new_high',
+  seRsLineBlueDot: 'se_rs_line_blue_dot',
+  rsLineBlueDotRecent: 'rs_line_blue_dot_recent',
   vcpDetected: 'vcp_detected',
   vcpReady: 'vcp_ready_for_breakout',
   maAlignment: 'ma_alignment',
@@ -102,20 +104,6 @@ const compareValues = (left, right) => {
     return String(left).localeCompare(String(right));
   }
   return Number(left) - Number(right);
-};
-
-const getScanModeSortPriority = (row) => {
-  const scanMode = row?.scan_mode;
-  if (!scanMode || scanMode === 'full') {
-    return 0;
-  }
-  if (scanMode === 'ipo_weighted') {
-    return 1;
-  }
-  if (scanMode === 'listing_only') {
-    return 2;
-  }
-  return 3;
 };
 
 const getSortValue = (row, sortBy) => {
@@ -191,7 +179,8 @@ export const filterStaticScanRows = (rows, filters) => {
     }
 
     for (const [filterKey, fieldName] of Object.entries(BOOLEAN_FILTER_TO_FIELD)) {
-      if (filters[filterKey] != null && Boolean(row[fieldName]) !== filters[filterKey]) {
+      const rowValue = row[fieldName] === true;
+      if (filters[filterKey] != null && rowValue !== filters[filterKey]) {
         return false;
       }
     }
@@ -204,22 +193,9 @@ export const sortStaticScanRows = (
   rows,
   sortBy,
   sortOrder = 'desc',
-  { prioritizeCompositeScanMode = true } = {},
 ) => {
   const direction = sortOrder === 'asc' ? 1 : -1;
-  const useCompositeModePriority = prioritizeCompositeScanMode &&
-    sortBy === 'composite_score' &&
-    sortOrder === 'desc';
   return [...rows].sort((left, right) => {
-    if (useCompositeModePriority) {
-      const modeComparison = compareValues(
-        getScanModeSortPriority(left),
-        getScanModeSortPriority(right),
-      );
-      if (modeComparison !== 0) {
-        return modeComparison;
-      }
-    }
     const leftValue = getSortValue(left, sortBy);
     const rightValue = getSortValue(right, sortBy);
     if (sortBy === 'composite_score' && sortOrder === 'desc') {
@@ -233,15 +209,6 @@ export const sortStaticScanRows = (
     const comparison = compareValues(leftValue, rightValue);
     if (comparison !== 0) {
       return comparison * direction;
-    }
-    if (useCompositeModePriority) {
-      const modeComparison = compareValues(
-        getScanModeSortPriority(left),
-        getScanModeSortPriority(right),
-      );
-      if (modeComparison !== 0) {
-        return modeComparison;
-      }
     }
     return compareValues(left.symbol, right.symbol);
   });

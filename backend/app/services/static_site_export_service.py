@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import json
 import logging
 import math
-from numbers import Integral, Real
 from pathlib import Path
 import shutil
 from typing import Any
@@ -19,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.analysis.patterns.rs_line import blue_dot_series, compute_rs_line
 from app.domain.common.query import FilterSpec, SortOrder, SortSpec
+from app.domain.feature_store.run_metadata import feature_run_market
 from app.domain.markets.catalog import get_market_catalog
 from app.domain.markets.key_markets import key_market_instruments
 from app.domain.scanning.default_filters import (
@@ -26,18 +25,23 @@ from app.domain.scanning.default_filters import (
     DEFAULT_SCAN_FILTERS_FALLBACK,
     resolve_default_scan_filters,
 )
+from app.infra.serialization import json_safe
 from app.infra.db.models.feature_store import FeatureRun, FeatureRunPointer
 from app.infra.db.repositories.feature_store_repo import SqlFeatureStoreRepository
-from app.schemas.groups import (
-    ConstituentStock,
-    GroupDetailResponse,
-    GroupRankResponse,
-    GroupRankingsResponse,
-    HistoricalDataPoint,
-    MoversResponse,
-)
 from app.schemas.scanning import FilterOptionsResponse, ScanResultItem
 from app.services.breadth_attribution_service import BreadthAttributionService
+from app.services.group_detail_payloads import scan_result_item_to_group_row
+from app.services.group_ranking_history import (
+    GROUP_RANK_CHANGE_OFFSETS,
+    apply_group_rank_changes,
+    build_group_details,
+    select_group_history_runs,
+    select_market_run_series,
+)
+from app.services.group_ranking_payloads import (
+    compute_group_rankings_from_serialized_rows,
+)
+from app.services.market_exposure_service import build_exposure_payload
 from app.services.preset_screens import (
     PRESET_SCREENS,
     get_preset_chart_symbols,
@@ -46,6 +50,10 @@ from app.services.preset_screens import (
 from app.services.static_groups_rrg_export import (
     StaticGroupsRRGUnavailableError,
     StaticGroupsRRGPayloadBuilder,
+)
+from app.services.static_groups_payload_builder import (
+    StaticGroupsSnapshot,
+    build_static_groups_payload,
 )
 from app.services.ui_snapshot_service import UISnapshotService
 from app.wiring.bootstrap import (
@@ -74,7 +82,6 @@ STATIC_DEFAULT_SCAN_FILTERS_FALLBACK = DEFAULT_SCAN_FILTERS_FALLBACK
 
 STATIC_CHART_PRESET_TOP_N = 200
 STATIC_CHART_TOP_N_GROUPS = 50
-STATIC_GROUP_DETAIL_HISTORY_DAYS = 100
 STATIC_BREADTH_HISTORY_LOOKBACK_DAYS = 90
 STATIC_BREADTH_ATTRIBUTION_LOOKBACK_DAYS = 10
 STATIC_BREADTH_ATTRIBUTION_MARKETS = ("US",)
@@ -86,14 +93,12 @@ STATIC_MARKET_DISPLAY = {
     market: _MARKET_CATALOG.get(market).label for market in STATIC_SUPPORTED_MARKETS
 }
 STATIC_GROUP_HISTORY_RUNS = 40
-STATIC_GROUP_CHANGE_OFFSETS = {
-    "1w": 5,
-    "1m": 21,
-    "3m": 63,
-    "6m": 126,
-}
+STATIC_GROUP_RUN_SERIES_LIMIT = max(
+    STATIC_GROUP_HISTORY_RUNS,
+    max(GROUP_RANK_CHANGE_OFFSETS.values()) + 1,
+)
 STATIC_GROUP_TABLE_FALLBACK_OFFSETS = {
-    period: STATIC_GROUP_CHANGE_OFFSETS[period]
+    period: GROUP_RANK_CHANGE_OFFSETS[period]
     for period in ("1w", "1m", "3m")
 }
 @dataclass(frozen=True)
@@ -299,7 +304,6 @@ class StaticSiteExportService:
                 expected_as_of_date=latest_run.as_of_date,
                 market=market,
                 latest_run=latest_run,
-                current_rows=scan_rows,
                 serialized_rows=serialized_rows,
             ),
         )
@@ -338,6 +342,7 @@ class StaticSiteExportService:
             ),
         )
         home_payload = self._build_home_payload(
+            db=db,
             generated_at=generated_at,
             latest_run=latest_run,
             market=market,
@@ -601,7 +606,7 @@ class StaticSiteExportService:
             if (
                 run is not None
                 and run.status == "published"
-                and (normalized_market is None or self._run_market(run) == normalized_market)
+                and (normalized_market is None or feature_run_market(run) == normalized_market)
             ):
                 return run
 
@@ -613,28 +618,30 @@ class StaticSiteExportService:
         if market is None:
             return query.first()
         for run in query.all():
-            if self._run_market(run) == normalized_market:
+            if feature_run_market(run) == normalized_market:
                 return run
         return None
 
-    @staticmethod
-    def _run_market(run: FeatureRun) -> str | None:
-        config = run.config_json or {}
-        if not isinstance(config, dict):
-            return None
-        universe = config.get("universe")
-        if isinstance(universe, dict):
-            market = universe.get("market")
-            if market:
-                return str(market).upper()
-        return None
-
-    def _load_scan_export_source(self, db: Session, run: FeatureRun) -> tuple[list[Any], Any]:
+    def _load_scan_export_rows(
+        self,
+        db: Session,
+        run: FeatureRun,
+        *,
+        include_sparklines: bool,
+    ) -> list[Any]:
         repo = SqlFeatureStoreRepository(db)
-        rows = repo.query_all_as_scan_results(
+        return repo.query_all_as_scan_results(
             run.id,
             FilterSpec(),
             SortSpec(field="composite_score", order=SortOrder.DESC),
+            include_sparklines=include_sparklines,
+        )
+
+    def _load_scan_export_source(self, db: Session, run: FeatureRun) -> tuple[list[Any], Any]:
+        repo = SqlFeatureStoreRepository(db)
+        rows = self._load_scan_export_rows(
+            db,
+            run,
             include_sparklines=True,
         )
         filter_options = repo.get_filter_options_for_run(run.id)
@@ -740,7 +747,7 @@ class StaticSiteExportService:
         chart_dir.mkdir(parents=True, exist_ok=True)
 
         # Market benchmark (fetched once) drives the per-symbol RS line + blue dots.
-        market = self._run_market(run) or STATIC_DEFAULT_MARKET
+        market = feature_run_market(run) or STATIC_DEFAULT_MARKET
         benchmark_symbol, benchmark_df = self._get_market_benchmark_history(market, period="2y")
 
         entries: list[dict[str, Any]] = []
@@ -1102,75 +1109,11 @@ class StaticSiteExportService:
         db: Session,
         generated_at: str,
         expected_as_of_date: date,
-        market: str | None = None,
-        latest_run: FeatureRun | None = None,
-        current_rows: list[Any] | None = None,
-        serialized_rows: list[dict[str, Any]] | None = None,
+        market: str,
+        latest_run: FeatureRun,
+        serialized_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        if market is None or latest_run is None or serialized_rows is None:
-            service = get_group_rank_service()
-            rankings = service.get_current_rankings(
-                db,
-                limit=197,
-                calculation_date=expected_as_of_date,
-            )
-            if not rankings:
-                raise StaticSiteSectionUnavailableError(
-                    section="groups",
-                    reason=(
-                        "No group rankings are available for static-site export date "
-                        f"{expected_as_of_date.isoformat()}."
-                    ),
-                )
-            movers = service.get_rank_movers(
-                db,
-                period="1w",
-                limit=10,
-                calculation_date=expected_as_of_date,
-            )
-            ranking_date = rankings[0]["date"]
-            if ranking_date != expected_as_of_date.isoformat():
-                raise StaticSiteSectionUnavailableError(
-                    section="groups",
-                    reason=(
-                        "Group rankings are stale for static-site export date "
-                        f"{expected_as_of_date.isoformat()} (latest ranking date: {ranking_date})."
-                    ),
-                )
-            group_details: dict[str, Any] = {}
-            for row in rankings:
-                group_name = row["industry_group"]
-                try:
-                    group_details[group_name] = service.get_group_history(
-                        db,
-                        group_name,
-                        days=STATIC_GROUP_DETAIL_HISTORY_DAYS,
-                    )
-                except Exception:
-                    logger.warning("Failed to export detail for group %s", group_name, exc_info=True)
-                    db.rollback()
-
-            return {
-                "schema_version": STATIC_SITE_SCHEMA_VERSION,
-                "generated_at": generated_at,
-                "available": True,
-                "payload": {
-                    "rankings": GroupRankingsResponse(
-                        date=ranking_date,
-                        total_groups=len(rankings),
-                        rankings=[GroupRankResponse(**row) for row in rankings],
-                    ).model_dump(mode="json"),
-                    "movers_period": "1w",
-                    "movers": MoversResponse(
-                        period=movers["period"],
-                        gainers=[GroupRankResponse(**row) for row in movers.get("gainers", [])],
-                        losers=[GroupRankResponse(**row) for row in movers.get("losers", [])],
-                    ).model_dump(mode="json"),
-                    "group_details": group_details,
-                },
-            }
-
-        rankings = self._compute_group_rankings_from_serialized_rows(
+        rankings = compute_group_rankings_from_serialized_rows(
             serialized_rows,
             ranking_date=expected_as_of_date,
         )
@@ -1182,54 +1125,63 @@ class StaticSiteExportService:
                     f"{expected_as_of_date.isoformat()}."
                 ),
             )
-        market_runs = self._get_market_run_series(db, market, latest_run)
-        history_runs = self._select_group_history_runs(market_runs)
-        historical_rankings = {
-            run.id: self._compute_group_rankings_from_rows(
-                self._load_scan_export_source(db, run)[0],
+        market_runs = select_market_run_series(
+            db,
+            market=market,
+            latest_run=latest_run,
+            min_runs=STATIC_GROUP_RUN_SERIES_LIMIT,
+            max_runs=STATIC_GROUP_RUN_SERIES_LIMIT,
+        )
+        history_runs = select_group_history_runs(
+            market_runs,
+            history_runs=STATIC_GROUP_HISTORY_RUNS,
+            offsets=GROUP_RANK_CHANGE_OFFSETS,
+        )
+        historical_rankings = {latest_run.id: rankings}
+        for run in history_runs:
+            if run.id in historical_rankings:
+                continue
+            historical_rankings[run.id] = self._compute_group_rankings_from_rows(
+                self._load_scan_export_rows(db, run, include_sparklines=False),
                 ranking_date=run.as_of_date,
             )
-            for run in history_runs
-        }
-        self._apply_group_rank_changes(rankings, market_runs, historical_rankings)
+        apply_group_rank_changes(
+            rankings,
+            market_runs,
+            historical_rankings,
+            offsets=GROUP_RANK_CHANGE_OFFSETS,
+        )
         self._apply_group_rank_changes_from_table(
             db,
             rankings,
             market=market,
             calculation_date=expected_as_of_date,
         )
-        group_details = self._build_group_details(
+        group_details = build_group_details(
             rankings=rankings,
             serialized_rows=serialized_rows,
             market_runs=market_runs,
             historical_rankings=historical_rankings,
+            history_limit=STATIC_GROUP_HISTORY_RUNS,
         )
         movers = self._build_group_movers(rankings)
 
-        return {
-            "schema_version": STATIC_SITE_SCHEMA_VERSION,
-            "generated_at": generated_at,
-            "available": True,
-            "market": market,
-            "payload": {
-                "rankings": GroupRankingsResponse(
-                    date=expected_as_of_date.isoformat(),
-                    total_groups=len(rankings),
-                    rankings=[GroupRankResponse(**row) for row in rankings],
-                ).model_dump(mode="json"),
-                "movers_period": "1w",
-                "movers": MoversResponse(
-                    period=movers["period"],
-                    gainers=[GroupRankResponse(**row) for row in movers.get("gainers", [])],
-                    losers=[GroupRankResponse(**row) for row in movers.get("losers", [])],
-                ).model_dump(mode="json"),
-                "group_details": group_details,
-            },
-        }
+        return build_static_groups_payload(
+            StaticGroupsSnapshot(
+                date=expected_as_of_date.isoformat(),
+                rankings=rankings,
+                movers=movers,
+                group_details=group_details,
+                market=market,
+            ),
+            generated_at=generated_at,
+            schema_version=STATIC_SITE_SCHEMA_VERSION,
+        )
 
     def _build_home_payload(
         self,
         *,
+        db: Session,
         generated_at: str,
         latest_run: FeatureRun,
         market: str,
@@ -1258,6 +1210,9 @@ class StaticSiteExportService:
                 "groups_latest_date": (((groups_payload.get("payload") or {}).get("rankings") or {}).get("date")),
             },
             "key_markets": key_markets,
+            # Pin exposure to the published run's date so the section stays
+            # coherent with the rest of home.json (breadth/groups/scan).
+            "market_health_exposure": build_exposure_payload(db, market, as_of_date=latest_run.as_of_date),
             "scan_summary": {
                 "run_id": latest_run.id,
                 "rows_total": scan_manifest.get("rows_total", 0),
@@ -1292,189 +1247,17 @@ class StaticSiteExportService:
             )
         return entries
 
-    def _get_market_run_series(
-        self,
-        db: Session,
-        market: str,
-        latest_run: FeatureRun,
-    ) -> list[FeatureRun]:
-        normalized_market = market.upper()
-        max_runs = max(STATIC_GROUP_HISTORY_RUNS, max(STATIC_GROUP_CHANGE_OFFSETS.values()) + 1)
-        published_runs = (
-            db.query(FeatureRun)
-            .filter(
-                FeatureRun.status == "published",
-                FeatureRun.as_of_date <= latest_run.as_of_date,
-            )
-            .order_by(FeatureRun.as_of_date.desc(), FeatureRun.published_at.desc(), FeatureRun.id.desc())
-            .all()
-        )
-        market_runs: list[FeatureRun] = []
-        seen_dates: set[date] = set()
-        for run in published_runs:
-            if self._run_market(run) != normalized_market:
-                continue
-            if run.as_of_date in seen_dates:
-                continue
-            market_runs.append(run)
-            seen_dates.add(run.as_of_date)
-            if len(market_runs) >= max_runs:
-                break
-        return market_runs
-
-    @staticmethod
-    def _select_group_history_runs(market_runs: list[FeatureRun]) -> list[FeatureRun]:
-        selected_indexes = set(range(min(STATIC_GROUP_HISTORY_RUNS, len(market_runs))))
-        selected_indexes.update(
-            offset
-            for offset in STATIC_GROUP_CHANGE_OFFSETS.values()
-            if offset < len(market_runs)
-        )
-        return [market_runs[index] for index in sorted(selected_indexes)]
-
     def _compute_group_rankings_from_rows(
         self,
         rows: list[Any],
         *,
         ranking_date: date,
     ) -> list[dict[str, Any]]:
-        normalized_rows = [self._extract_group_row_payload(row) for row in rows]
-        return self._compute_group_rankings_from_serialized_rows(
+        normalized_rows = [scan_result_item_to_group_row(row) for row in rows]
+        return compute_group_rankings_from_serialized_rows(
             normalized_rows,
             ranking_date=ranking_date,
         )
-
-    def _compute_group_rankings_from_serialized_rows(
-        self,
-        rows: list[dict[str, Any]],
-        *,
-        ranking_date: date,
-    ) -> list[dict[str, Any]]:
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in rows:
-            group_name = row.get("ibd_industry_group")
-            rs_rating = row.get("rs_rating")
-            if not group_name or rs_rating is None:
-                continue
-            grouped[str(group_name)].append(row)
-
-        rankings: list[dict[str, Any]] = []
-        ranking_date_str = ranking_date.isoformat()
-        for group_name, group_rows in grouped.items():
-            rs_values = [float(row["rs_rating"]) for row in group_rows if row.get("rs_rating") is not None]
-            if not rs_values:
-                continue
-            avg_rs = round(sum(rs_values) / len(rs_values), 2)
-            median_rs = round(float(pd.Series(rs_values).median()), 2)
-            std_dev = round(float(pd.Series(rs_values).std(ddof=0)), 2) if len(rs_values) > 1 else 0.0
-            weight_pairs = [
-                (
-                    float(row.get("market_cap_usd") or row.get("market_cap") or 0),
-                    float(row["rs_rating"]),
-                )
-                for row in group_rows
-                if row.get("rs_rating") is not None
-            ]
-            total_weight = sum(weight for weight, _ in weight_pairs if weight > 0)
-            weighted_avg = (
-                round(sum(weight * value for weight, value in weight_pairs if weight > 0) / total_weight, 2)
-                if total_weight > 0
-                else None
-            )
-            top_row = max(
-                group_rows,
-                key=lambda row: (
-                    row.get("rs_rating") if row.get("rs_rating") is not None else float("-inf"),
-                    row.get("composite_score") if row.get("composite_score") is not None else float("-inf"),
-                ),
-            )
-            above_80 = sum(1 for value in rs_values if value >= 80)
-            rankings.append(
-                {
-                    "industry_group": group_name,
-                    "date": ranking_date_str,
-                    "rank": 0,
-                    "avg_rs_rating": avg_rs,
-                    "median_rs_rating": median_rs,
-                    "weighted_avg_rs_rating": weighted_avg,
-                    "rs_std_dev": std_dev,
-                    "num_stocks": len(rs_values),
-                    "num_stocks_rs_above_80": above_80,
-                    "pct_rs_above_80": round((above_80 / len(rs_values)) * 100, 2) if rs_values else None,
-                    "top_symbol": top_row.get("symbol"),
-                    "top_symbol_name": top_row.get("company_name"),
-                    "top_rs_rating": top_row.get("rs_rating"),
-                    "rank_change_1w": None,
-                    "rank_change_1m": None,
-                    "rank_change_3m": None,
-                    "rank_change_6m": None,
-                }
-            )
-
-        rankings.sort(
-            key=lambda row: (
-                -(row.get("avg_rs_rating") or 0),
-                -(row.get("weighted_avg_rs_rating") or 0),
-                -(row.get("num_stocks") or 0),
-                row["industry_group"],
-            )
-        )
-        for index, row in enumerate(rankings, start=1):
-            row["rank"] = index
-        return rankings
-
-    @staticmethod
-    def _extract_group_row_payload(row: Any) -> dict[str, Any]:
-        extended = getattr(row, "extended_fields", {}) or {}
-        return {
-            "symbol": getattr(row, "symbol", None),
-            "company_name": extended.get("company_name"),
-            "composite_score": getattr(row, "composite_score", None),
-            "current_price": getattr(row, "current_price", None),
-            "rs_rating": extended.get("rs_rating"),
-            "rs_rating_1m": extended.get("rs_rating_1m"),
-            "rs_rating_3m": extended.get("rs_rating_3m"),
-            "rs_rating_12m": extended.get("rs_rating_12m"),
-            "eps_growth_qq": extended.get("eps_growth_qq"),
-            "eps_growth_yy": extended.get("eps_growth_yy"),
-            "sales_growth_qq": extended.get("sales_growth_qq"),
-            "sales_growth_yy": extended.get("sales_growth_yy"),
-            "stage": extended.get("stage"),
-            "market_cap": extended.get("market_cap"),
-            "market_cap_usd": extended.get("market_cap_usd"),
-            "ibd_industry_group": extended.get("ibd_industry_group"),
-            "price_sparkline_data": extended.get("price_sparkline_data"),
-            "price_trend": extended.get("price_trend"),
-            "price_change_1d": extended.get("price_change_1d"),
-            "rs_sparkline_data": extended.get("rs_sparkline_data"),
-            "rs_trend": extended.get("rs_trend"),
-        }
-
-    @staticmethod
-    def _group_rank_map(rankings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        return {row["industry_group"]: row for row in rankings}
-
-    def _apply_group_rank_changes(
-        self,
-        rankings: list[dict[str, Any]],
-        market_runs: list[FeatureRun],
-        historical_rankings: dict[int, list[dict[str, Any]]],
-    ) -> None:
-        for period, offset in STATIC_GROUP_CHANGE_OFFSETS.items():
-            key = f"rank_change_{period}"
-            if offset >= len(market_runs):
-                for ranking in rankings:
-                    ranking[key] = None
-                continue
-            reference_run = market_runs[offset]
-            reference_map = self._group_rank_map(historical_rankings.get(reference_run.id, []))
-            for ranking in rankings:
-                historical = reference_map.get(ranking["industry_group"])
-                ranking[key] = (
-                    historical["rank"] - ranking["rank"]
-                    if historical is not None
-                    else None
-                )
 
     def _apply_group_rank_changes_from_table(
         self,
@@ -1523,95 +1306,6 @@ class StaticSiteExportService:
                 if historical_rank is None:
                     continue
                 ranking[key] = historical_rank - ranking["rank"]
-
-    def _build_group_details(
-        self,
-        *,
-        rankings: list[dict[str, Any]],
-        serialized_rows: list[dict[str, Any]],
-        market_runs: list[FeatureRun],
-        historical_rankings: dict[int, list[dict[str, Any]]],
-    ) -> dict[str, Any]:
-        current_rows_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in serialized_rows:
-            group_name = row.get("ibd_industry_group")
-            if group_name:
-                current_rows_by_group[str(group_name)].append(row)
-
-        history_runs = market_runs[:STATIC_GROUP_HISTORY_RUNS]
-        ranking_maps = {
-            run.id: self._group_rank_map(historical_rankings.get(run.id, []))
-            for run in history_runs
-        }
-        details: dict[str, Any] = {}
-        for ranking in rankings:
-            group_name = ranking["industry_group"]
-            history = []
-            for run in history_runs:
-                historical = ranking_maps.get(run.id, {}).get(group_name)
-                if historical is None:
-                    continue
-                history.append(
-                    HistoricalDataPoint(
-                        date=historical["date"],
-                        rank=historical["rank"],
-                        avg_rs_rating=historical["avg_rs_rating"],
-                        num_stocks=historical["num_stocks"],
-                    ).model_dump(mode="json")
-                )
-
-            stocks = sorted(
-                current_rows_by_group.get(group_name, []),
-                key=lambda row: (
-                    row.get("rs_rating") if row.get("rs_rating") is not None else float("-inf"),
-                    row.get("composite_score") if row.get("composite_score") is not None else float("-inf"),
-                ),
-                reverse=True,
-            )
-            stock_payload = [
-                ConstituentStock(
-                    symbol=row["symbol"],
-                    company_name=row.get("company_name"),
-                    price=row.get("current_price"),
-                    rs_rating=row.get("rs_rating"),
-                    rs_rating_1m=row.get("rs_rating_1m"),
-                    rs_rating_3m=row.get("rs_rating_3m"),
-                    rs_rating_12m=row.get("rs_rating_12m"),
-                    eps_growth_qq=row.get("eps_growth_qq"),
-                    eps_growth_yy=row.get("eps_growth_yy"),
-                    sales_growth_qq=row.get("sales_growth_qq"),
-                    sales_growth_yy=row.get("sales_growth_yy"),
-                    composite_score=row.get("composite_score"),
-                    stage=row.get("stage"),
-                    price_sparkline_data=row.get("price_sparkline_data"),
-                    price_trend=row.get("price_trend"),
-                    price_change_1d=row.get("price_change_1d"),
-                    rs_sparkline_data=row.get("rs_sparkline_data"),
-                    rs_trend=row.get("rs_trend"),
-                ).model_dump(mode="json")
-                for row in stocks
-            ]
-
-            details[group_name] = GroupDetailResponse(
-                industry_group=group_name,
-                current_rank=ranking["rank"],
-                current_avg_rs=ranking["avg_rs_rating"],
-                current_median_rs=ranking.get("median_rs_rating"),
-                current_weighted_avg_rs=ranking.get("weighted_avg_rs_rating"),
-                current_rs_std_dev=ranking.get("rs_std_dev"),
-                num_stocks=ranking["num_stocks"],
-                pct_rs_above_80=ranking.get("pct_rs_above_80"),
-                top_symbol=ranking.get("top_symbol"),
-                top_symbol_name=ranking.get("top_symbol_name"),
-                top_rs_rating=ranking.get("top_rs_rating"),
-                rank_change_1w=ranking.get("rank_change_1w"),
-                rank_change_1m=ranking.get("rank_change_1m"),
-                rank_change_3m=ranking.get("rank_change_3m"),
-                rank_change_6m=ranking.get("rank_change_6m"),
-                history=history,
-                stocks=stock_payload,
-            ).model_dump(mode="json")
-        return details
 
     @staticmethod
     def _build_group_movers(rankings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1877,17 +1571,6 @@ class StaticSiteExportService:
             if row.get("volume") is not None and row["volume"] >= min_volume
         ]
 
-    @staticmethod
-    def _static_scan_mode_sort_priority(row: dict[str, Any]) -> int:
-        mode = row.get("scan_mode")
-        if not mode or mode == "full":
-            return 0
-        if mode == "ipo_weighted":
-            return 1
-        if mode == "listing_only":
-            return 2
-        return 3
-
     @classmethod
     def _sort_static_scan_rows(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         def _score_key(row: dict[str, Any]) -> float:
@@ -1899,8 +1582,7 @@ class StaticSiteExportService:
         return sorted(
             rows,
             key=lambda row: (
-                cls._static_scan_mode_sort_priority(row),
-                -_score_key(row) if row.get("scan_mode") != "listing_only" else 0,
+                -_score_key(row),
                 row.get("symbol") or "",
             ),
         )
@@ -1987,42 +1669,13 @@ class StaticSiteExportService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(
-                _sanitize_static_json(payload),
+                json_safe(payload),
                 allow_nan=False,
                 indent=2,
                 sort_keys=True,
-                default=_json_default,
             ) + "\n",
             encoding="utf-8",
         )
-
-
-def _sanitize_static_json(value: Any) -> Any:
-    """Return a browser-parseable JSON value tree."""
-
-    if value is None or isinstance(value, (str, bool)):
-        return value
-    if isinstance(value, Integral):
-        return int(value)
-    if isinstance(value, Real):
-        number = float(value)
-        return number if math.isfinite(number) else None
-    if isinstance(value, dict):
-        return {key: _sanitize_static_json(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_static_json(item) for item in value]
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return value
-
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _coerce_datetime(value: Any) -> str | None:

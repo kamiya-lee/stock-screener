@@ -88,6 +88,10 @@ describe('ResultsTable', () => {
     it('renders se_pivot_price as $198.50', () => {
       expect(screen.getByText('$198.50')).toBeInTheDocument();
     });
+
+    it('renders first-class RS blue dot with the new-high date tooltip', () => {
+      expect(screen.getByTitle('RS blue dot: latest RS high 2026-01-06')).toBeInTheDocument();
+    });
   });
 
   // ── SE column rendering — null data ──────────────────────────────────
@@ -166,7 +170,7 @@ describe('ResultsTable', () => {
   describe('SE column headers', () => {
     it('renders all 7 SE header labels', () => {
       renderWithProviders(<ResultsTable {...defaultProps} />);
-      const headers = ['SE', 'Pat', 'Pvt%', 'Sqz', 'V50', 'RSH', 'Pvt$'];
+      const headers = ['SE', 'Pat', 'Pvt%', 'Sqz', 'V50', 'RSH', 'SEBD', 'RSBD', 'Pvt$'];
       headers.forEach((label) => {
         expect(screen.getByText(label)).toBeInTheDocument();
       });
@@ -200,6 +204,23 @@ describe('ResultsTable', () => {
       // Compact variant: first theme renders as a chip, with a +N counter for overflow.
       expect(screen.getByText('AI Infrastructure')).toBeInTheDocument();
       expect(screen.getByText('+1')).toBeInTheDocument();
+    });
+
+    it('keeps group rank compact and exposes the rank date in a tooltip', () => {
+      renderWithProviders(
+        <ResultsTable
+          {...defaultProps}
+          results={[{
+            ...fullSeRow,
+            ibd_group_rank: 153,
+            ibd_group_rank_date: '2026-06-14',
+          }]}
+        />
+      );
+
+      const rankCell = screen.getByText('153').closest('td');
+      expect(rankCell).toHaveAttribute('title', 'Group rank 153 as of Jun 14, 2026');
+      expect(screen.queryByText(/Jun 14, 2026/)).not.toBeInTheDocument();
     });
   });
 

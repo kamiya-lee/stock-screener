@@ -8,6 +8,7 @@ leading groups, top groups, freshness dates) instead of ~14 round-trips.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,16 +20,18 @@ from sqlalchemy.orm import Session
 from app.domain.common.query import FilterSpec, PageSpec, QuerySpec, SortOrder, SortSpec
 from app.domain.markets.catalog import get_market_catalog
 from app.domain.scanning.default_filters import resolve_default_scan_filters
+from app.infra.serialization import json_safe
 from app.models.market_breadth import MarketBreadth
 from app.models.scan_result import Scan
 from app.schemas.scanning import ScanResultItem
 from app.services.key_market_history import build_key_market_entries
+from app.services.market_exposure_service import build_exposure_payload
 from app.services.redis_pool import get_redis_client
 from app.use_cases.scanning.get_scan_results import GetScanResultsQuery
 
 logger = logging.getLogger(__name__)
 
-DAILY_SNAPSHOT_SCHEMA_VERSION = 1
+DAILY_SNAPSHOT_SCHEMA_VERSION = 2
 DAILY_SNAPSHOT_CACHE_TTL_SECONDS = 600
 DAILY_SNAPSHOT_TOP_RESULTS = 20
 LEADERS_MAX_GROUP_RANK = 40
@@ -56,6 +59,15 @@ def daily_snapshot_cache_key(market: str, scan_id: str | None) -> str:
 
 def daily_snapshot_etag(payload_json: str) -> str:
     return 'W/"{}"'.format(hashlib.sha1(payload_json.encode("utf-8")).hexdigest())
+
+
+def serialize_daily_snapshot_payload(payload: dict[str, Any]) -> str:
+    """Serialize Daily Snapshot payloads as browser-parseable strict JSON."""
+    return json.dumps(
+        json_safe(payload),
+        allow_nan=False,
+        separators=(",", ":"),
+    )
 
 
 def _prune_daily_snapshot_memory_cache(now: float) -> None:
@@ -330,6 +342,7 @@ def build_daily_snapshot_payload(
         "scan_id": freshness["scan_id"],
         "freshness": freshness,
         "key_markets": build_key_market_entries(db, normalized),
+        "market_health_exposure": build_exposure_payload(db, normalized),
         "top_candidates": {
             "min_dollar_volume": min_volume,
             "rows": top_candidates,

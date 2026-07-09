@@ -52,6 +52,25 @@ const MCAP_DISPLAY = Object.freeze({
   LOCAL: 'local',
 });
 
+const formatGroupRankDate = (value) => {
+  if (!value) return null;
+  const [year, month, day] = String(value).split('-').map((part) => Number(part));
+  if (year && month && day) {
+    return new Intl.DateTimeFormat('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    }).format(new Date(Date.UTC(year, month - 1, day)));
+  }
+  return String(value);
+};
+
+const getGroupRankTooltip = (row) => {
+  if (row.ibd_group_rank == null || !row.ibd_group_rank_date) return undefined;
+  return `Group rank ${row.ibd_group_rank} as of ${formatGroupRankDate(row.ibd_group_rank_date)}`;
+};
+
 // Column definitions with explicit widths
 const columns = [
   { id: 'chart', label: '', sortable: false, width: 60 },
@@ -76,7 +95,8 @@ const columns = [
   { id: 'se_bb_width_pctile_252', label: 'Sqz', sortable: true, width: 45 },
   { id: 'se_volume_vs_50d', label: 'V50', sortable: true, width: 45 },
   { id: 'se_rs_line_new_high', label: 'RSH', sortable: false, width: 35 },
-  { id: 'se_rs_line_blue_dot', label: 'BD', sortable: false, width: 35 },
+  { id: 'se_rs_line_blue_dot', label: 'SEBD', sortable: false, width: 42 },
+  { id: 'rs_line_blue_dot_recent', label: 'RSBD', sortable: true, width: 42 },
   { id: 'se_pivot_price', label: 'Pvt$', sortable: true, width: 55 },
   { id: 'rs_rating', label: 'RS', sortable: true, width: 40 },
   { id: 'rs_rating_1m', label: '1M', sortable: true, width: 40 },
@@ -263,7 +283,7 @@ const VirtualTableRow = memo(function VirtualTableRow({
         <MarketThemesList themes={row.market_themes} variant="compact" />
       </TableCell>
 
-      <TableCell align="center" sx={{
+      <TableCell align="center" title={getGroupRankTooltip(row)} sx={{
         fontFamily: 'monospace',
         color: getGroupRankColor(row.ibd_group_rank),
         fontWeight: row.ibd_group_rank && row.ibd_group_rank <= 20 ? 600 : 400,
@@ -324,11 +344,22 @@ const VirtualTableRow = memo(function VirtualTableRow({
         )}
       </TableCell>
 
-      <TableCell align="center" sx={{ width: 35, minWidth: 35 }}>
+      <TableCell align="center" sx={{ width: 42, minWidth: 42 }}>
         {row.se_rs_line_blue_dot ? (
           <Box
             sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#2196f3', display: 'inline-block' }}
-            title="RS line at new high before price (blue dot)"
+            title="Setup Engine RS line at new high before price"
+          />
+        ) : (
+          <Box component="span" sx={{ color: 'text.disabled' }}>-</Box>
+        )}
+      </TableCell>
+
+      <TableCell align="center" sx={{ width: 42, minWidth: 42 }}>
+        {row.rs_line_blue_dot_recent ? (
+          <Box
+            sx={{ width: 10, height: 10, borderRadius: '50%', bgcolor: '#2196f3', display: 'inline-block' }}
+            title={row.rs_line_new_high_date ? `RS blue dot: latest RS high ${row.rs_line_new_high_date}` : 'RS blue dot within 5 trading days'}
           />
         ) : (
           <Box component="span" sx={{ color: 'text.disabled' }}>-</Box>
@@ -485,10 +516,14 @@ const VirtualTableRow = memo(function VirtualTableRow({
          prevProps.row.gics_sector === nextProps.row.gics_sector &&
          prevProps.row.ibd_industry_group === nextProps.row.ibd_industry_group &&
          prevProps.row.ibd_group_rank === nextProps.row.ibd_group_rank &&
+         prevProps.row.ibd_group_rank_date === nextProps.row.ibd_group_rank_date &&
          prevProps.row.scan_mode === nextProps.row.scan_mode &&
          prevProps.row.data_status === nextProps.row.data_status &&
          prevProps.row.is_scannable === nextProps.row.is_scannable &&
          prevProps.row.composite_reason === nextProps.row.composite_reason &&
+         prevProps.row.se_rs_line_blue_dot === nextProps.row.se_rs_line_blue_dot &&
+         prevProps.row.rs_line_blue_dot_recent === nextProps.row.rs_line_blue_dot_recent &&
+         prevProps.row.rs_line_new_high_date === nextProps.row.rs_line_new_high_date &&
          (prevProps.row.market_themes || []).join('|') === (nextProps.row.market_themes || []).join('|') &&
          prevProps.row.rating === nextProps.row.rating &&
          prevProps.mcapDisplay === nextProps.mcapDisplay &&

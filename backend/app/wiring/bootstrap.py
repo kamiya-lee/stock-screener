@@ -399,7 +399,6 @@ class RuntimeServices:
                     from app.services.daily_price_bundle_service import DailyPriceBundleService
 
                     self._daily_price_bundle_service = DailyPriceBundleService(
-                        price_cache=self.cache_bundle().price,
                         market_calendar=self.market_calendar_service(),
                     )
         return self._daily_price_bundle_service
@@ -735,11 +734,11 @@ def get_create_scan_use_case() -> CreateScanUseCase:
     :func:`get_create_scan_use_case_without_freshness_gate` instead.
     """
     from app.use_cases.scanning.create_scan import CreateScanUseCase
-    from app.services.market_data_freshness import check_symbol_freshness
+    from app.services.market_data_freshness import evaluate_symbol_freshness
 
     return CreateScanUseCase(
         dispatcher=get_task_dispatcher(),
-        freshness_checker=check_symbol_freshness,
+        freshness_evaluator=evaluate_symbol_freshness,
     )
 
 
@@ -754,7 +753,7 @@ def get_create_scan_use_case_without_freshness_gate() -> CreateScanUseCase:
 
     return CreateScanUseCase(
         dispatcher=get_task_dispatcher(),
-        freshness_checker=None,
+        freshness_evaluator=None,
     )
 
 

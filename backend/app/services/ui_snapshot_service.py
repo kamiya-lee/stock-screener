@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-import math
 import json
 import logging
 from threading import Lock
@@ -17,6 +16,7 @@ from app.config import settings
 from app.database import is_corruption_error
 from app.domain.analytics.scope import market_scope_tag
 from app.domain.scanning.filter_spec import PageSpec, QuerySpec, SortOrder, SortSpec
+from app.infra.serialization import json_safe
 from app.infra.db.uow import SqlUnitOfWork
 from app.models.industry import IBDGroupRank
 from app.models.market_breadth import MarketBreadth
@@ -40,6 +40,7 @@ from app.schemas.scanning import (
     ScanResultItem,
     ScanResultsResponse,
     ScanStatusResponse,
+    normalize_scan_warnings_for_response,
 )
 from app.schemas.theme import (
     AlertsResponse,
@@ -339,7 +340,7 @@ class UISnapshotService:
         source_revision: str,
         payload: dict[str, Any],
     ) -> SnapshotResult:
-        payload = _json_safe(payload)
+        payload = json_safe(payload)
         current = self._get_current(db, view_key=view_key, variant_key=variant_key)
         row = (
             db.query(UIViewSnapshot)
@@ -475,6 +476,9 @@ class UISnapshotService:
                     started_at=scan.started_at,
                     completed_at=scan.completed_at,
                     source="feature_store" if scan.feature_run_id else "scan_results",
+                    warnings=normalize_scan_warnings_for_response(
+                        getattr(scan, "warnings", None)
+                    ),
                 )
                 for scan in scans
             ]
@@ -520,6 +524,9 @@ class UISnapshotService:
                     started_at=selected_scan.started_at,
                     completed_at=selected_scan.completed_at,
                     source="feature_store" if selected_scan.feature_run_id else "scan_results",
+                    warnings=normalize_scan_warnings_for_response(
+                        getattr(selected_scan, "warnings", None)
+                    ),
                 ).model_dump(mode="json"),
             )
             completed_stocks = selected_scan.total_stocks or 0
@@ -548,6 +555,9 @@ class UISnapshotService:
                 started_at=selected_scan.started_at,
                 eta_seconds=None,
                 universe_def=selected_universe_def,
+                warnings=normalize_scan_warnings_for_response(
+                    getattr(selected_scan, "warnings", None)
+                ),
             ).model_dump(mode="json")
 
             if selected_scan.status not in {"completed", "cancelled"}:
@@ -892,22 +902,6 @@ def market_breadth_to_dict(row: MarketBreadth | None) -> dict[str, Any] | None:
         "total_stocks_scanned": row.total_stocks_scanned,
         "calculation_duration_seconds": row.calculation_duration_seconds,
     }
-
-
-def _json_safe(value: Any) -> Any:
-    """Convert snapshot payloads into plain JSON-serializable values."""
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, float):
-        # Postgres JSON/JSONB rejects non-finite numbers. Coerce NaN/Inf to null.
-        if not math.isfinite(value):
-            return None
-        return value
-    return value
 
 
 def _drop_snapshot_tables(conn) -> None:
